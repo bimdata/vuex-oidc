@@ -2,6 +2,7 @@ import { objectAssign } from '../services/utils'
 import { getOidcConfig, getOidcCallbackPath, createOidcUserManager, addUserManagerEventListener, removeUserManagerEventListener, tokenIsExpired, tokenExp } from '../services/oidc-helpers'
 import { dispatchCustomBrowserEvent } from '../services/browser-event'
 import { openUrlWithIframe } from '../services/navigation'
+import { User } from 'oidc-client'
 
 export default (oidcSettings, storeSettings = {}, oidcEventListeners = {}) => {
   const oidcConfig = getOidcConfig(oidcSettings)
@@ -38,6 +39,47 @@ export default (oidcSettings, storeSettings = {}, oidcEventListeners = {}) => {
       })
     })
   }
+
+  /*
+  Monkey patch oidcUserManager to hijack login with force logout
+  */
+  async function signinEndWithForcedLogout (url, args = {}) {
+    const signinResponse = await this.processSigninResponse(url)
+    console.debug('UserManager._signinEnd: got signin response')
+    const identityProvider = signinResponse.profile.preferred_username.split('.')[0]
+    if (identityProvider !== 'bimdataconnect') {
+      const params = new URLSearchParams({
+        post_logout_redirect_uri: oidcSettings.post_logout_redirect_uri,
+        id_token_hint: signinResponse.id_token,
+        initiating_idp: identityProvider
+      })
+      const redirectUrl = oidcSettings.logoutUrl + '?' + params.toString()
+      window.location.replace(redirectUrl)
+      await new Promise((resolve, reject) => {
+        // Wait for window.location.replace to trigger
+        setTimeout(resolve, 5000)
+      })
+    }
+
+    const user = new User(signinResponse)
+
+    if (args.current_sub) {
+      if (args.current_sub !== user.profile.sub) {
+        console.debug('UserManager._signinEnd: current user does not match user returned from signin. sub from signin: ', user.profile.sub)
+        throw new Error('login_required')
+      } else {
+        console.debug('UserManager._signinEnd: current user matches user returned from signin')
+      }
+    }
+    await this.storeUser(user)
+    console.debug('UserManager._signinEnd: user stored')
+
+    this._events.load(user)
+    return user
+  }
+  signinEndWithForcedLogout.bind(oidcUserManager)
+
+  oidcUserManager._signinEnd = signinEndWithForcedLogout
 
   const state = {
     access_token: null,
